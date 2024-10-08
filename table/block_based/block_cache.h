@@ -40,6 +40,14 @@ class Block_kIndex : public Block {
   static constexpr BlockType kBlockType = BlockType::kIndex;
 };
 
+class Block_kIndexToBlob : public Block {
+ public:
+  using Block::Block;
+
+  static constexpr CacheEntryRole kCacheEntryRole = CacheEntryRole::kIndexBlock;
+  static constexpr BlockType kBlockType = BlockType::kIndexToBlob;
+};
+
 class Block_kFilterPartitionIndex : public Block {
  public:
   using Block::Block;
@@ -122,6 +130,7 @@ struct BlockCreateContext : public Cache::CreateContext {
 
   void Create(std::unique_ptr<Block_kData>* parsed_out, BlockContents&& block);
   void Create(std::unique_ptr<Block_kIndex>* parsed_out, BlockContents&& block);
+  void Create(std::unique_ptr<Block_kIndexToBlob>* parsed_out, BlockContents&& block);
   void Create(std::unique_ptr<Block_kFilterPartitionIndex>* parsed_out,
               BlockContents&& block);
   void Create(std::unique_ptr<Block_kRangeDeletion>* parsed_out,

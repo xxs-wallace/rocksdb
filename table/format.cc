@@ -151,6 +151,36 @@ std::string IndexValue::ToString(bool hex, bool have_first_key) const {
     return s;
   }
 }
+void BlockIndexHandle::EncodeTo(std::string* dst, bool have_first_key) const {
+  if (have_first_key) {
+    PutLengthPrefixedSlice(dst, first_internal_key);
+  }
+  PutFixed64(dst, block_id);
+  // PutLengthPrefixedSlice(dst, filter_data);
+}
+
+Status BlockIndexHandle::DecodeFrom(Slice* input, bool have_first_key) {
+  if (!have_first_key) {
+    first_internal_key = Slice();
+  } else if (!GetLengthPrefixedSlice(input, &first_internal_key)) {
+    return Status::Corruption("bad first key in block info");
+  } else if (!GetFixed64(input, &block_id)) {
+    return Status::Corruption("bad first key in block info");
+  } /*else if (!GetLengthPrefixedSlice(input, &filter_data)) {
+    return Status::Corruption("bad first key in block info");
+  } */
+  return Status::OK();
+}
+
+std::string BlockIndexHandle::ToString(bool hex, bool have_first_key) const {
+  std::string s;
+  EncodeTo(&s, have_first_key);
+  if (hex) {
+    return Slice(s).ToString(true);
+  } else {
+    return s;
+  }
+}
 
 namespace {
 inline bool IsLegacyFooterFormat(uint64_t magic_number) {

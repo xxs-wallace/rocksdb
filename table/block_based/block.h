@@ -39,6 +39,7 @@ class DataBlockIter;
 class IndexBlockIter;
 class MetaBlockIter;
 class BlockPrefixIndex;
+class BlobIndexBlockIter;
 
 // BlockReadAmpBitmap is a bitmap that map the ROCKSDB_NAMESPACE::Block data
 // bytes to a bitmap with ratio bytes_per_bit. Whenever we access a range of
@@ -241,6 +242,14 @@ class Block {
       bool user_defined_timestamps_persisted = true,
       BlockPrefixIndex* prefix_index = nullptr);
 
+  BlobIndexBlockIter* NewBlobIndexBlockIterator(
+      const Comparator* raw_ucmp, SequenceNumber global_seqno,
+      BlobIndexBlockIter* iter, Statistics* stats, bool total_order_seek,
+      bool have_first_key, bool key_includes_seq,
+      bool block_contents_pinned = false,
+      bool user_defined_timestamps_persisted = true,
+      BlockPrefixIndex* prefix_index = nullptr);
+
   // Report an approximation of how much memory has been used.
   size_t ApproximateMemoryUsage() const;
 
@@ -261,6 +270,9 @@ class Block {
   void InitializeIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
                                           const Comparator* raw_ucmp,
                                           bool value_is_full,
+                                          bool index_has_first_key);
+  void InitializeBlobIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
+                                          const Comparator* raw_ucmp,
                                           bool index_has_first_key);
 
   // Initializes per key-value checksum protection.
@@ -927,6 +939,141 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
   // previous delta encoded values in the same restart interval to the offset of
   // the first value in that restart interval.
   IndexValue decoded_value_;
+
+  // When sequence number overwriting is enabled, this struct contains the seqno
+  // to overwrite with, and current first_internal_key with overwritten seqno.
+  // This is rarely used, so we put it behind a pointer and only allocate when
+  // needed.
+  struct GlobalSeqnoState {
+    // First internal key according to current index entry, but with sequence
+    // number overwritten to global_seqno.
+    IterKey first_internal_key;
+    SequenceNumber global_seqno;
+
+    explicit GlobalSeqnoState(SequenceNumber seqno) : global_seqno(seqno) {}
+  };
+
+  std::unique_ptr<GlobalSeqnoState> global_seqno_state_;
+
+  // Buffers the `first_internal_key` referred by `decoded_value_` when
+  // `pad_min_timestamp_` is true.
+  std::string first_internal_key_with_ts_;
+
+  // Set *prefix_may_exist to false if no key possibly share the same prefix
+  // as `target`. If not set, the result position should be the same as total
+  // order Seek.
+  bool PrefixSeek(const Slice& target, uint32_t* index, bool* prefix_may_exist);
+  // Set *prefix_may_exist to false if no key can possibly share the same
+  // prefix as `target`. If not set, the result position should be the same
+  // as total order seek.
+  bool BinaryBlockIndexSeek(const Slice& target, uint32_t* block_ids,
+                            uint32_t left, uint32_t right, uint32_t* index,
+                            bool* prefix_may_exist);
+  inline int CompareBlockKey(uint32_t block_index, const Slice& target);
+
+  inline bool ParseNextIndexKey();
+
+  // When value_delta_encoded_ is enabled it decodes the value which is assumed
+  // to be BlockHandle and put it to decoded_value_
+  inline void DecodeCurrentValue(bool is_shared);
+};
+
+class BlobIndexBlockIter final : public BlockIter<BlockIndexHandle> {
+ public:
+  BlobIndexBlockIter() : BlockIter(), prefix_index_(nullptr) {}
+
+  // key_includes_seq, default true, means that the keys are in internal key
+  // format.
+  // value_is_full, default true, means that no delta encoding is
+  // applied to values.
+  void Initialize(const Comparator* raw_ucmp, const char* data,
+                  uint32_t restarts, uint32_t num_restarts,
+                  SequenceNumber global_seqno, BlockPrefixIndex* prefix_index,
+                  bool have_first_key, bool key_includes_seq,
+                  bool block_contents_pinned,
+                  bool user_defined_timestamps_persisted,
+                  uint8_t protection_bytes_per_key, const char* kv_checksum,
+                  uint32_t block_restart_interval) {
+    InitializeBase(raw_ucmp, data, restarts, num_restarts,
+                   kDisableGlobalSequenceNumber, block_contents_pinned,
+                   user_defined_timestamps_persisted, protection_bytes_per_key,
+                   kv_checksum, block_restart_interval);
+    raw_key_.SetIsUserKey(!key_includes_seq);
+    prefix_index_ = prefix_index;
+    have_first_key_ = have_first_key;
+    if (have_first_key_ && global_seqno != kDisableGlobalSequenceNumber) {
+      global_seqno_state_.reset(new GlobalSeqnoState(global_seqno));
+    } else {
+      global_seqno_state_.reset();
+    }
+  }
+
+  Slice user_key() const override {
+    assert(Valid());
+    return raw_key_.GetUserKey();
+  }
+
+  BlockIndexHandle value() const override {
+    assert(Valid());
+    if (global_seqno_state_ != nullptr || pad_min_timestamp_) {
+      return decoded_value_;
+    } else {
+      BlockIndexHandle entry;
+      Slice v = value_;
+      Status decode_s __attribute__((__unused__)) =
+          entry.DecodeFrom(&v, have_first_key_);
+      assert(decode_s.ok());
+      return entry;
+    }
+  }
+
+  Slice raw_value() const {
+    assert(Valid());
+    return value_;
+  }
+
+  bool IsValuePinned() const override {
+    return global_seqno_state_ != nullptr ? false : BlockIter::IsValuePinned();
+  }
+
+ protected:
+  friend Block;
+  // IndexBlockIter follows a different contract for prefix iterator
+  // from data iterators.
+  // If prefix of the seek key `target` exists in the file, it must
+  // return the same result as total order seek.
+  // If the prefix of `target` doesn't exist in the file, it can either
+  // return the result of total order seek, or set both of Valid() = false
+  // and status() = NotFound().
+  void SeekImpl(const Slice& target) override;
+
+  void SeekForPrevImpl(const Slice&) override {
+    assert(false);
+    current_ = restarts_;
+    restart_index_ = num_restarts_;
+    status_ = Status::InvalidArgument(
+        "RocksDB internal error: should never call SeekForPrev() on index "
+        "blocks");
+    raw_key_.Clear();
+    value_.clear();
+  }
+
+  void PrevImpl() override;
+  void NextImpl() override;
+  void SeekToFirstImpl() override;
+  void SeekToLastImpl() override;
+
+ private:
+  bool value_delta_encoded_;
+  bool have_first_key_;  // value includes first_internal_key
+  BlockPrefixIndex* prefix_index_;
+  // Whether the value is delta encoded. In that case the value is assumed to be
+  // BlockHandle. The first value in each restart interval is the full encoded
+  // BlockHandle; the restart of encoded size part of the BlockHandle. The
+  // offset of delta encoded BlockHandles is computed by adding the size of
+  // previous delta encoded values in the same restart interval to the offset of
+  // the first value in that restart interval.
+  BlockIndexHandle decoded_value_;
 
   // When sequence number overwriting is enabled, this struct contains the seqno
   // to overwrite with, and current first_internal_key with overwritten seqno.

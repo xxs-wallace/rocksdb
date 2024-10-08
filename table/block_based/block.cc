@@ -193,7 +193,30 @@ void IndexBlockIter::PrevImpl() {
   }
   --cur_entry_idx_;
 }
+void BlobIndexBlockIter::NextImpl() {
+  ParseNextIndexKey();
+  ++cur_entry_idx_;
+}
 
+void BlobIndexBlockIter::PrevImpl() {
+  assert(Valid());
+  // Scan backwards to a restart point before current_
+  const uint32_t original = current_;
+  while (GetRestartPoint(restart_index_) >= original) {
+    if (restart_index_ == 0) {
+      // No more entries
+      current_ = restarts_;
+      restart_index_ = num_restarts_;
+      return;
+    }
+    restart_index_--;
+  }
+  SeekToRestartPoint(restart_index_);
+  // Loop until end of current entry hits the start of original entry
+  while (ParseNextIndexKey() && NextEntryOffset() < original) {
+  }
+  --cur_entry_idx_;
+}
 void MetaBlockIter::PrevImpl() {
   assert(Valid());
   // Scan backwards to a restart point before current_
@@ -506,6 +529,48 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
   FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
 }
 
+void BlobIndexBlockIter::SeekImpl(const Slice& target) {
+#ifndef NDEBUG
+  if (TEST_Corrupt_Callback("IndexBlockIter::SeekImpl")) {
+    return;
+  }
+#endif
+  TEST_SYNC_POINT("IndexBlockIter::Seek:0");
+  PERF_TIMER_GUARD(block_seek_nanos);
+  if (data_ == nullptr) {  // Not init yet
+    return;
+  }
+  Slice seek_key = target;
+  if (raw_key_.IsUserKey()) {
+    seek_key = ExtractUserKey(target);
+  }
+  status_ = Status::OK();
+  uint32_t index = 0;
+  bool skip_linear_scan = false;
+  bool ok = false;
+  if (prefix_index_) {
+    bool prefix_may_exist = true;
+    ok = PrefixSeek(target, &index, &prefix_may_exist);
+    if (!prefix_may_exist) {
+      // This is to let the caller to distinguish between non-existing prefix,
+      // and when key is larger than the last key, which both set Valid() to
+      // false.
+      current_ = restarts_;
+      status_ = Status::NotFound();
+    }
+    // restart interval must be one when hash search is enabled so the binary
+    // search simply lands at the right place.
+    skip_linear_scan = true;
+  } else {
+    ok = BinarySeek<DecodeKey>(seek_key, &index, &skip_linear_scan);
+  }
+
+  if (!ok) {
+    return;
+  }
+  FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
+}
+
 void DataBlockIter::SeekForPrevImpl(const Slice& target) {
   PERF_TIMER_GUARD(block_seek_nanos);
   Slice seek_key = target;
@@ -593,6 +658,21 @@ void IndexBlockIter::SeekToFirstImpl() {
   cur_entry_idx_ = 0;
 }
 
+void BlobIndexBlockIter::SeekToFirstImpl() {
+#ifndef NDEBUG
+  if (TEST_Corrupt_Callback("IndexBlockIter::SeekToFirstImpl")) {
+    return;
+  }
+#endif
+  if (data_ == nullptr) {  // Not init yet
+    return;
+  }
+  status_ = Status::OK();
+  SeekToRestartPoint(0);
+  ParseNextIndexKey();
+  cur_entry_idx_ = 0;
+}
+
 void DataBlockIter::SeekToLastImpl() {
   if (data_ == nullptr) {  // Not init yet
     return;
@@ -623,6 +703,18 @@ void MetaBlockIter::SeekToLastImpl() {
 }
 
 void IndexBlockIter::SeekToLastImpl() {
+  if (data_ == nullptr) {  // Not init yet
+    return;
+  }
+  status_ = Status::OK();
+  SeekToRestartPoint(num_restarts_ - 1);
+  cur_entry_idx_ = (num_restarts_ - 1) * block_restart_interval_;
+  while (ParseNextIndexKey() && NextEntryOffset() < restarts_) {
+    ++cur_entry_idx_;
+  }
+}
+
+void BlobIndexBlockIter::SeekToLastImpl() {
   if (data_ == nullptr) {  // Not init yet
     return;
   }
@@ -744,6 +836,64 @@ void IndexBlockIter::DecodeCurrentValue(bool is_shared) {
   Status decode_s __attribute__((__unused__)) = decoded_value_.DecodeFrom(
       &v, have_first_key_,
       (value_delta_encoded_ && is_shared) ? &decoded_value_.handle : nullptr);
+  assert(decode_s.ok());
+  value_ = Slice(value_.data(), v.data() - value_.data());
+
+  if (global_seqno_state_ != nullptr) {
+    // Overwrite sequence number the same way as in DataBlockIter.
+
+    IterKey& first_internal_key = global_seqno_state_->first_internal_key;
+    first_internal_key.SetInternalKey(decoded_value_.first_internal_key,
+                                      /* copy */ true);
+
+    assert(GetInternalKeySeqno(first_internal_key.GetInternalKey()) == 0);
+
+    ValueType value_type = ExtractValueType(first_internal_key.GetKey());
+    assert(value_type == ValueType::kTypeValue ||
+           value_type == ValueType::kTypeMerge ||
+           value_type == ValueType::kTypeDeletion ||
+           value_type == ValueType::kTypeRangeDeletion ||
+           value_type == ValueType::kTypeWideColumnEntity);
+
+    first_internal_key.UpdateInternalKey(global_seqno_state_->global_seqno,
+                                         value_type);
+    decoded_value_.first_internal_key = first_internal_key.GetKey();
+  }
+  if (pad_min_timestamp_ && !decoded_value_.first_internal_key.empty()) {
+    first_internal_key_with_ts_.clear();
+    PadInternalKeyWithMinTimestamp(&first_internal_key_with_ts_,
+                                   decoded_value_.first_internal_key, ts_sz_);
+    decoded_value_.first_internal_key = first_internal_key_with_ts_;
+  }
+}
+bool BlobIndexBlockIter::ParseNextIndexKey() {
+  bool is_shared = false;
+  bool ok =ParseNextKey<DecodeEntry>(&is_shared);
+  if (ok) {
+    if (global_seqno_state_ != nullptr ||
+        pad_min_timestamp_) {
+      DecodeCurrentValue(is_shared);
+    }
+  }
+  return ok;
+}
+
+// The format:
+// restart_point   0: k, v (off, sz), k, v (delta-sz), ..., k, v (delta-sz)
+// restart_point   1: k, v (off, sz), k, v (delta-sz), ..., k, v (delta-sz)
+// ...
+// restart_point n-1: k, v (off, sz), k, v (delta-sz), ..., k, v (delta-sz)
+// where, k is key, v is value, and its encoding is in parentheses.
+// The format of each key is (shared_size, non_shared_size, shared, non_shared)
+// The format of each value, i.e., block handle, is (offset, size) whenever the
+// is_shared is false, which included the first entry in each restart point.
+// Otherwise, the format is delta-size = the size of current block - the size o
+// last block.
+void BlobIndexBlockIter::DecodeCurrentValue(bool is_shared) {
+  Slice v(value_.data(), data_ + restarts_ - value_.data());
+  // Delta encoding is used if `shared` != 0.
+  Status decode_s __attribute__((__unused__)) = decoded_value_.DecodeFrom(
+      &v, have_first_key_);
   assert(decode_s.ok());
   value_ = Slice(value_.data(), v.data() - value_.data());
 
@@ -1015,6 +1165,132 @@ bool IndexBlockIter::PrefixSeek(const Slice& target, uint32_t* index,
   }
 }
 
+// Compare target key and the block key of the block of `block_index`.
+// Return -1 if error.
+int BlobIndexBlockIter::CompareBlockKey(uint32_t block_index, const Slice& target) {
+  uint32_t region_offset = GetRestartPoint(block_index);
+  uint32_t shared, non_shared;
+  const char* key_ptr = DecodeKey()(data_ + region_offset, data_ + restarts_, &shared,
+                        &non_shared);
+  if (key_ptr == nullptr || (shared != 0)) {
+    CorruptionError();
+    return 1;  // Return target is smaller
+  }
+  Slice block_key(key_ptr, non_shared);
+  UpdateRawKeyAndMaybePadMinTimestamp(block_key);
+  return CompareCurrentKey(target);
+}
+
+// Binary search in block_ids to find the first block
+// with a key >= target
+bool BlobIndexBlockIter::BinaryBlockIndexSeek(const Slice& target,
+                                          uint32_t* block_ids, uint32_t left,
+                                          uint32_t right, uint32_t* index,
+                                          bool* prefix_may_exist) {
+  assert(left <= right);
+  assert(index);
+  assert(prefix_may_exist);
+  *prefix_may_exist = true;
+  uint32_t left_bound = left;
+
+  while (left <= right) {
+    uint32_t mid = (right + left) / 2;
+
+    int cmp = CompareBlockKey(block_ids[mid], target);
+    if (!status_.ok()) {
+      return false;
+    }
+    if (cmp < 0) {
+      // Key at "target" is larger than "mid". Therefore all
+      // blocks before or at "mid" are uninteresting.
+      left = mid + 1;
+    } else {
+      // Key at "target" is <= "mid". Therefore all blocks
+      // after "mid" are uninteresting.
+      // If there is only one block left, we found it.
+      if (left == right) {
+        break;
+      }
+      right = mid;
+    }
+  }
+
+  if (left == right) {
+    // In one of the two following cases:
+    // (1) left is the first one of block_ids
+    // (2) there is a gap of blocks between block of `left` and `left-1`.
+    // we can further distinguish the case of key in the block or key not
+    // existing, by comparing the target key and the key of the previous
+    // block to the left of the block found.
+    if (block_ids[left] > 0 &&
+        (left == left_bound || block_ids[left - 1] != block_ids[left] - 1) &&
+        CompareBlockKey(block_ids[left] - 1, target) > 0) {
+      current_ = restarts_;
+      *prefix_may_exist = false;
+      return false;
+    }
+
+    *index = block_ids[left];
+    return true;
+  } else {
+    assert(left > right);
+
+    // If the next block key is larger than seek key, it is possible that
+    // no key shares the prefix with `target`, or all keys with the same
+    // prefix as `target` are smaller than prefix. In the latter case,
+    // we are mandated to set the position the same as the total order.
+    // In the latter case, either:
+    // (1) `target` falls into the range of the next block. In this case,
+    //     we can place the iterator to the next block, or
+    // (2) `target` is larger than all block keys. In this case we can
+    //     keep the iterator invalidate without setting `prefix_may_exist`
+    //     to false.
+    // We might sometimes end up with setting the total order position
+    // while there is no key sharing the prefix as `target`, but it
+    // still follows the contract.
+    uint32_t right_index = block_ids[right];
+    assert(right_index + 1 <= num_restarts_);
+    if (right_index + 1 < num_restarts_) {
+      if (CompareBlockKey(right_index + 1, target) >= 0) {
+        *index = right_index + 1;
+        return true;
+      } else {
+        // We have to set the flag here because we are not positioning
+        // the iterator to the total order position.
+        *prefix_may_exist = false;
+      }
+    }
+
+    // Mark iterator invalid
+    current_ = restarts_;
+    return false;
+  }
+}
+
+bool BlobIndexBlockIter::PrefixSeek(const Slice& target, uint32_t* index,
+                                bool* prefix_may_exist) {
+  assert(index);
+  assert(prefix_may_exist);
+  assert(prefix_index_);
+  *prefix_may_exist = true;
+  Slice seek_key = target;
+  if (raw_key_.IsUserKey()) {
+    seek_key = ExtractUserKey(target);
+  }
+  uint32_t* block_ids = nullptr;
+  uint32_t num_blocks = prefix_index_->GetBlocks(target, &block_ids);
+
+  if (num_blocks == 0) {
+    current_ = restarts_;
+    *prefix_may_exist = false;
+    return false;
+  } else {
+    assert(block_ids);
+    return BinaryBlockIndexSeek(seek_key, block_ids, 0, num_blocks - 1, index,
+                                prefix_may_exist);
+  }
+}
+
 uint32_t Block::NumRestarts() const {
   assert(size_ >= 2 * sizeof(uint32_t));
   uint32_t block_footer = DecodeFixed32(data_ + size_ - sizeof(uint32_t));
@@ -1204,6 +1480,54 @@ void Block::InitializeIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
   }
 }
 
+void Block::InitializeBlobIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
+                                               const Comparator* raw_ucmp,
+                                               bool index_has_first_key) {
+  protection_bytes_per_key_ = 0;
+  if (num_restarts_ > 0 && protection_bytes_per_key > 0) {
+    // Note that `global_seqno` and `key_includes_seq` are hardcoded here. They
+    // do not impact how the index block is parsed. During checksum
+    // construction/verification, we use the entire key buffer from
+    // raw_key_.GetKey() returned by iter->key() as the `key` part of key-value
+    // checksum, and the content of this buffer do not change for different
+    // values of `global_seqno` or `key_includes_seq`.
+    // TODO(yuzhangyu): handle the implication of padding timestamp for kv
+    // protection.
+    std::unique_ptr<BlobIndexBlockIter> iter{ NewBlobIndexBlockIterator (
+        raw_ucmp, kDisableGlobalSequenceNumber /* global_seqno */, nullptr,
+        nullptr /* Statistics */, true /* total_order_seek */,
+        index_has_first_key /* have_first_key */, false /* key_includes_seq */,
+        true /* block_contents_pinned */,
+        true /* user_defined_timestamps_persisted*/,
+        nullptr /* prefix_index */)};
+    if (iter->status().ok()) {
+      block_restart_interval_ = iter->GetRestartInterval();
+    }
+    uint32_t num_keys = 0;
+    if (iter->status().ok()) {
+      num_keys = iter->NumberOfKeys(block_restart_interval_);
+    }
+    if (iter->status().ok()) {
+      checksum_size_ = num_keys * protection_bytes_per_key;
+      kv_checksum_ = new char[(size_t)checksum_size_];
+      iter->SeekToFirst();
+      size_t i = 0;
+      while (iter->Valid()) {
+        GenerateKVChecksum(kv_checksum_ + i, protection_bytes_per_key,
+                           iter->key(), iter->raw_value());
+        iter->Next();
+        i += protection_bytes_per_key;
+      }
+      assert(!iter->status().ok() || i == num_keys * protection_bytes_per_key);
+    }
+    if (!iter->status().ok()) {
+      size_ = 0;  // Error marker
+      return;
+    }
+    protection_bytes_per_key_ = protection_bytes_per_key;
+  }
+}
+
 void Block::InitializeMetaIndexBlockProtectionInfo(
     uint8_t protection_bytes_per_key) {
   protection_bytes_per_key_ = 0;
@@ -1317,6 +1641,39 @@ IndexBlockIter* Block::NewIndexIterator(
     ret_iter->Initialize(
         raw_ucmp, data_, restart_offset_, num_restarts_, global_seqno,
         prefix_index_ptr, have_first_key, key_includes_seq, value_is_full,
+        block_contents_pinned, user_defined_timestamps_persisted,
+        protection_bytes_per_key_, kv_checksum_, block_restart_interval_);
+  }
+
+  return ret_iter;
+}
+
+BlobIndexBlockIter* Block::NewBlobIndexBlockIterator(
+    const Comparator* raw_ucmp, SequenceNumber global_seqno,
+    BlobIndexBlockIter* iter, Statistics* /*stats*/, bool total_order_seek,
+    bool have_first_key, bool key_includes_seq,
+    bool block_contents_pinned, bool user_defined_timestamps_persisted,
+    BlockPrefixIndex* prefix_index) {
+  BlobIndexBlockIter* ret_iter;
+  if (iter != nullptr) {
+    ret_iter = iter;
+  } else {
+    ret_iter = new BlobIndexBlockIter;
+  }
+  if (size_ < 2 * sizeof(uint32_t)) {
+    ret_iter->Invalidate(Status::Corruption("bad block contents"));
+    return ret_iter;
+  }
+  if (num_restarts_ == 0) {
+    // Empty block.
+    ret_iter->Invalidate(Status::OK());
+    return ret_iter;
+  } else {
+    BlockPrefixIndex* prefix_index_ptr =
+        total_order_seek ? nullptr : prefix_index;
+    ret_iter->Initialize(
+        raw_ucmp, data_, restart_offset_, num_restarts_, global_seqno,
+        prefix_index_ptr, have_first_key, key_includes_seq,
         block_contents_pinned, user_defined_timestamps_persisted,
         protection_bytes_per_key_, kv_checksum_, block_restart_interval_);
   }

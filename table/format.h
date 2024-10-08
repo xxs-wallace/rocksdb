@@ -119,6 +119,25 @@ struct IndexValue {
   std::string ToString(bool hex, bool have_first_key) const;
 };
 
+struct BlockIndexHandle {
+  uint64_t block_id;
+  Slice first_internal_key;
+  // Slice filter_data;
+  BlockIndexHandle() = default;
+  BlockIndexHandle(uint64_t _block_id, Slice _first_internal_key /*, Slice _filter_data */)
+      : block_id(_block_id), first_internal_key(_first_internal_key) /*, filter_data(_filter_data) */ {}
+
+  // have_first_key indicates whether the `first_internal_key` is used.
+  // If previous_handle is not null, delta encoding is used;
+  // in this case, the two handles must point to consecutive blocks:
+  // handle.offset() ==
+  //     previous_handle->offset() + previous_handle->size() + kBlockTrailerSize
+  void EncodeTo(std::string* dst, bool have_first_key) const;
+  Status DecodeFrom(Slice* input, bool have_first_key);
+
+  std::string ToString(bool hex, bool have_first_key) const;
+};
+
 // Given a file's base_context_checksum and an offset of a block within that
 // file, choose a 32-bit value that is as unique as possible. This value will
 // be added to the standard checksum to get a checksum "with context," or can

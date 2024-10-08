@@ -24,6 +24,13 @@ void BlockCreateContext::Create(std::unique_ptr<Block_kIndex>* parsed_out,
       protection_bytes_per_key, raw_ucmp, index_value_is_full,
       index_has_first_key);
 }
+void BlockCreateContext::Create(std::unique_ptr<Block_kIndexToBlob>* parsed_out,
+                                BlockContents&& block) {
+  parsed_out->reset(new Block_kIndexToBlob(std::move(block),
+                                     /*read_amp_bytes_per_bit*/ 0, statistics));
+  parsed_out->get()->InitializeBlobIndexBlockProtectionInfo(
+      protection_bytes_per_key, raw_ucmp, index_has_first_key);
+}
 void BlockCreateContext::Create(
     std::unique_ptr<Block_kFilterPartitionIndex>* parsed_out,
     BlockContents&& block) {
